@@ -1,8 +1,6 @@
 """
-Verity Backend - Session 3
-Added: DistilBERT-based phishing classifier replacing rule-based NLP
-Model: distilbert-base-uncased fine-tuned on phishing/spam detection
-Falls back to rule-based NLP if model fails to load
+Verity Backend - Session 3 (HuggingFace Inference API)
+NLP via HuggingFace API - no torch, no RAM issues, free tier compatible
 """
 
 from fastapi import FastAPI, HTTPException
@@ -31,45 +29,8 @@ app.add_middleware(
 SAFE_BROWSING_KEY = os.environ.get("GOOGLE_SAFE_BROWSING_KEY", "")
 SAFE_BROWSING_URL = "https://safebrowsing.googleapis.com/v4/threatMatches:find"
 RDAP_BASE = "https://rdap.org/domain/"
-
-# --- DistilBERT Model Load ---------------------------------------------------
-
-classifier = None
-MODEL_LOADED = False
-
-def load_model():
-    """
-    Load DistilBERT fine-tuned on phishing detection.
-    Uses 'madhurjindal/autonlp-Gibberish-Detector-492513457' as a fallback
-    but primarily targets phishing-specific models.
-    We use 'elozano/bert-base-cased-phishing-email' - trained specifically
-    on phishing email datasets.
-    Falls back gracefully to rule-based NLP if loading fails.
-    """
-    global classifier, MODEL_LOADED
-    try:
-        from transformers import pipeline
-        logger.info("[Verity] Loading DistilBERT phishing classifier...")
-        
-        # Primary: phishing-specific BERT model (small, ~250MB)
-        classifier = pipeline(
-            "text-classification",
-            model="mrm8488/bert-tiny-finetuned-sms-spam-detection",
-            truncation=True,
-            max_length=512,
-        )
-        MODEL_LOADED = True
-        logger.info("[Verity] DistilBERT model loaded successfully")
-    except Exception as e:
-        logger.warning(f"[Verity] Model load failed, using rule-based NLP: {e}")
-        MODEL_LOADED = False
-
-
-@app.on_event("startup")
-async def startup_event():
-    # Load model in background so server starts immediately
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, load_model)
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
+HF_API_URL = "https://api-inference.huggingface.co/models/mrm8488/bert-tiny-finetuned-sms-spam-detection"
 
 
 # --- Models ------------------------------------------------------------------
@@ -78,7 +39,7 @@ class AnalyzeRequest(BaseModel):
     domain: str
     subject: Optional[str] = ""
     urls: Optional[list[str]] = []
-    body: Optional[str] = ""  # Session 3: full email body for deep NLP
+    body: Optional[str] = ""
 
 
 class DomainAgeResult(BaseModel):
@@ -92,7 +53,7 @@ class DomainAgeResult(BaseModel):
 class NLPResult(BaseModel):
     severity: int
     flags: list[str]
-    model_used: str  # 'distilbert' or 'rule-based'
+    model_used: str
     confidence: Optional[float]
 
 
@@ -167,53 +128,55 @@ def analyze_nlp_rules(text: str) -> NLPResult:
     )
 
 
-# --- DistilBERT NLP ----------------------------------------------------------
+# --- HuggingFace Inference API NLP -------------------------------------------
 
-def analyze_nlp_model(text: str) -> NLPResult:
+async def analyze_nlp_model(text: str) -> NLPResult:
     """
-    Run text through the phishing classifier.
-    Model outputs: PHISHING or LEGITIMATE with a confidence score.
-    We map confidence to a severity deduction.
+    Send text to HuggingFace Inference API for spam/phishing classification.
+    Falls back to rule-based NLP if API is unavailable or token not set.
     """
-    global classifier, MODEL_LOADED
-
-    if not MODEL_LOADED or classifier is None:
+    if not text or not HF_TOKEN:
         return analyze_nlp_rules(text)
 
-    if not text or len(text.strip()) < 10:
-        return NLPResult(severity=0, flags=[], model_used="distilbert", confidence=0.0)
-
     try:
-        # Truncate to 512 tokens worth of text (~1800 chars)
-        truncated = text[:1800]
-        result = classifier(truncated)[0]
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(
+                HF_API_URL,
+                headers={"Authorization": f"Bearer {HF_TOKEN}"},
+                json={"inputs": text[:512]},
+            )
 
-        label = result['label'].upper()
-        confidence = round(result['score'], 3)
+            if resp.status_code != 200:
+                return analyze_nlp_rules(text)
 
-        if 'PHISH' in label or label in ('LABEL_1', 'PHISHING', 'SPAM'):
-            # Scale severity: 50% confidence = 0 penalty, 95%+ = 30 penalty
-            severity = int(max(0, (confidence - 0.5) / 0.5) * 30)
-            flags = [f"AI classifier: phishing detected ({int(confidence * 100)}% confidence)"]
-        else:
-            # Legitimate - low or no penalty
-            severity = 0
-            flags = [f"AI classifier: looks legitimate ({int(confidence * 100)}% confidence)"] if confidence > 0.85 else []
+            result = resp.json()
 
-        # Also run rules on top and take the max
-        rule_result = analyze_nlp_rules(text)
-        final_severity = max(severity, rule_result.severity)
-        final_flags = flags + [f for f in rule_result.flags if f not in flags]
+            # Response is [[{label, score}, {label, score}]]
+            scores = result[0] if isinstance(result[0], list) else result
+            spam = next((s for s in scores if s['label'].upper() in ('SPAM', 'LABEL_1')), None)
 
-        return NLPResult(
-            severity=min(30, final_severity),
-            flags=final_flags[:5],
-            model_used="distilbert",
-            confidence=confidence,
-        )
+            rule_result = analyze_nlp_rules(text)
+
+            if spam and spam['score'] > 0.6:
+                severity = int((spam['score'] - 0.5) / 0.5 * 30)
+                flags = [f"AI: phishing/spam detected ({int(spam['score'] * 100)}% confidence)"] + rule_result.flags[:3]
+                return NLPResult(
+                    severity=min(30, max(severity, rule_result.severity)),
+                    flags=flags[:5],
+                    model_used="huggingface-api",
+                    confidence=round(spam['score'], 3),
+                )
+
+            # Looks legitimate - still apply rule-based on top
+            return NLPResult(
+                severity=rule_result.severity,
+                flags=rule_result.flags,
+                model_used="huggingface-api",
+                confidence=round(spam['score'], 3) if spam else None,
+            )
 
     except Exception as e:
-        logger.warning(f"[Verity] Model inference failed, falling back: {e}")
+        logger.warning(f"[Verity] HF API failed, falling back to rules: {e}")
         return analyze_nlp_rules(text)
 
 
@@ -360,7 +323,7 @@ async def health():
         "status": "ok",
         "service": "Verity API",
         "version": "3.0.0",
-        "model_loaded": MODEL_LOADED,
+        "nlp": "huggingface-api" if HF_TOKEN else "rule-based",
     }
 
 
@@ -370,13 +333,11 @@ async def analyze(req: AnalyzeRequest):
         raise HTTPException(status_code=400, detail="Invalid domain")
 
     domain = req.domain.lower().strip().lstrip("www.")
-
-    # Combine subject + body for NLP analysis
     full_text = f"{req.subject or ''} {req.body or ''}".strip()
 
     domain_age, nlp, safe_browsing, reputation = await asyncio.gather(
         get_domain_age(domain),
-        asyncio.to_thread(analyze_nlp_model, full_text),
+        analyze_nlp_model(full_text),
         check_safe_browsing(req.urls or []),
         check_domain_reputation(domain),
     )
