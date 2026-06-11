@@ -1,6 +1,6 @@
 """
-Verity Backend - Session 3 (HuggingFace Inference API)
-NLP via HuggingFace API - no torch, no RAM issues, free tier compatible
+Verity Backend - Session 4
+Added: federated phishing reports, community blocklist via PostgreSQL
 """
 
 from fastapi import FastAPI, HTTPException
@@ -14,10 +14,11 @@ import dns.resolver
 from datetime import datetime, timezone
 from typing import Optional
 import logging
+import asyncpg
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Verity API", version="3.0.0")
+app = FastAPI(title="Verity API", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,6 +32,42 @@ SAFE_BROWSING_URL = "https://safebrowsing.googleapis.com/v4/threatMatches:find"
 RDAP_BASE = "https://rdap.org/domain/"
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 HF_API_URL = "https://api-inference.huggingface.co/models/mrm8488/bert-tiny-finetuned-sms-spam-detection"
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+# --- Database ----------------------------------------------------------------
+
+db_pool = None
+
+async def get_db():
+    global db_pool
+    if db_pool is None:
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    return db_pool
+
+async def init_db():
+    """Create verity_reports table if it doesn't exist."""
+    try:
+        pool = await get_db()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS verity_reports (
+                    id SERIAL PRIMARY KEY,
+                    domain TEXT NOT NULL,
+                    report_count INTEGER DEFAULT 1,
+                    first_reported TIMESTAMPTZ DEFAULT NOW(),
+                    last_reported TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE(domain)
+                )
+            """)
+        logger.info("[Verity] Database initialized")
+    except Exception as e:
+        logger.error(f"[Verity] DB init failed: {e}")
+
+
+@app.on_event("startup")
+async def startup():
+    if DATABASE_URL:
+        await init_db()
 
 
 # --- Models ------------------------------------------------------------------
@@ -40,6 +77,10 @@ class AnalyzeRequest(BaseModel):
     subject: Optional[str] = ""
     urls: Optional[list[str]] = []
     body: Optional[str] = ""
+
+
+class ReportRequest(BaseModel):
+    domain: str
 
 
 class DomainAgeResult(BaseModel):
@@ -71,15 +112,23 @@ class ReputationResult(BaseModel):
     reason: Optional[str]
 
 
+class CommunityResult(BaseModel):
+    reported: bool
+    report_count: int
+    severity: int
+    reason: Optional[str]
+
+
 class AnalyzeResponse(BaseModel):
     domain: str
     domainAge: DomainAgeResult
     nlpSignals: NLPResult
     safeBrowsing: SafeBrowsingResult
     reputation: ReputationResult
+    community: CommunityResult
 
 
-# --- Rule-Based NLP (fallback) -----------------------------------------------
+# --- Rule-Based NLP ----------------------------------------------------------
 
 URGENCY_PATTERNS = [
     (r"\burgent\b", "Urgency trigger: urgent", 8),
@@ -110,34 +159,21 @@ URGENCY_PATTERNS = [
 def analyze_nlp_rules(text: str) -> NLPResult:
     if not text:
         return NLPResult(severity=0, flags=[], model_used="rule-based", confidence=None)
-
     text_lower = text.lower()
     flags = []
     total_severity = 0
-
     for pattern, label, weight in URGENCY_PATTERNS:
         if re.search(pattern, text_lower):
             flags.append(label)
             total_severity += weight
-
-    return NLPResult(
-        severity=min(30, total_severity),
-        flags=flags[:5],
-        model_used="rule-based",
-        confidence=None,
-    )
+    return NLPResult(severity=min(30, total_severity), flags=flags[:5], model_used="rule-based", confidence=None)
 
 
-# --- HuggingFace Inference API NLP -------------------------------------------
+# --- HuggingFace NLP ---------------------------------------------------------
 
 async def analyze_nlp_model(text: str) -> NLPResult:
-    """
-    Send text to HuggingFace Inference API for spam/phishing classification.
-    Falls back to rule-based NLP if API is unavailable or token not set.
-    """
     if not text or not HF_TOKEN:
         return analyze_nlp_rules(text)
-
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.post(
@@ -145,18 +181,12 @@ async def analyze_nlp_model(text: str) -> NLPResult:
                 headers={"Authorization": f"Bearer {HF_TOKEN}"},
                 json={"inputs": text[:512]},
             )
-
             if resp.status_code != 200:
                 return analyze_nlp_rules(text)
-
             result = resp.json()
-
-            # Response is [[{label, score}, {label, score}]]
             scores = result[0] if isinstance(result[0], list) else result
             spam = next((s for s in scores if s['label'].upper() in ('SPAM', 'LABEL_1')), None)
-
             rule_result = analyze_nlp_rules(text)
-
             if spam and spam['score'] > 0.6:
                 severity = int((spam['score'] - 0.5) / 0.5 * 30)
                 flags = [f"AI: phishing/spam detected ({int(spam['score'] * 100)}% confidence)"] + rule_result.flags[:3]
@@ -166,17 +196,14 @@ async def analyze_nlp_model(text: str) -> NLPResult:
                     model_used="huggingface-api",
                     confidence=round(spam['score'], 3),
                 )
-
-            # Looks legitimate - still apply rule-based on top
             return NLPResult(
                 severity=rule_result.severity,
                 flags=rule_result.flags,
                 model_used="huggingface-api",
                 confidence=round(spam['score'], 3) if spam else None,
             )
-
     except Exception as e:
-        logger.warning(f"[Verity] HF API failed, falling back to rules: {e}")
+        logger.warning(f"[Verity] HF API failed: {e}")
         return analyze_nlp_rules(text)
 
 
@@ -188,24 +215,18 @@ async def get_domain_age(domain: str) -> DomainAgeResult:
             resp = await client.get(f"{RDAP_BASE}{domain}")
             if resp.status_code != 200:
                 return DomainAgeResult(domain=domain, age_days=None, created_date=None, severity=0, reason="WHOIS unavailable")
-
             data = resp.json()
             created_date = None
-
             for event in data.get("events", []):
                 if event.get("eventAction") in ("registration", "registration date"):
                     created_date = event.get("eventDate")
                     break
-
             if not created_date:
                 return DomainAgeResult(domain=domain, age_days=None, created_date=None, severity=0, reason="Creation date not found")
-
             created_dt = datetime.fromisoformat(created_date.replace("Z", "+00:00"))
             age_days = (datetime.now(timezone.utc) - created_dt).days
-
             severity = 0
             reason = None
-
             if age_days < 30:
                 severity = 30
                 reason = f"Domain is only {age_days} days old - very high risk"
@@ -218,15 +239,7 @@ async def get_domain_age(domain: str) -> DomainAgeResult:
             elif age_days < 365:
                 severity = 8
                 reason = f"Domain is less than 1 year old ({age_days} days)"
-
-            return DomainAgeResult(
-                domain=domain,
-                age_days=age_days,
-                created_date=created_date[:10],
-                severity=severity,
-                reason=reason,
-            )
-
+            return DomainAgeResult(domain=domain, age_days=age_days, created_date=created_date[:10], severity=severity, reason=reason)
     except Exception as e:
         return DomainAgeResult(domain=domain, age_days=None, created_date=None, severity=0, reason=f"Lookup failed: {str(e)[:60]}")
 
@@ -235,16 +248,13 @@ async def get_domain_age(domain: str) -> DomainAgeResult:
 
 async def check_safe_browsing(urls: list[str]) -> SafeBrowsingResult:
     empty = SafeBrowsingResult(threats_found=0, threat_urls=[], severity=0, reason=None)
-
     if not SAFE_BROWSING_KEY or not urls:
         return empty
-
     clean_urls = [u for u in urls if u.startswith(('http://', 'https://')) and len(u) < 2048]
     if not clean_urls:
         return empty
-
     payload = {
-        "client": {"clientId": "verity-extension", "clientVersion": "3.0.0"},
+        "client": {"clientId": "verity-extension", "clientVersion": "4.0.0"},
         "threatInfo": {
             "threatTypes": ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE", "POTENTIALLY_HARMFUL_APPLICATION"],
             "platformTypes": ["ANY_PLATFORM"],
@@ -252,26 +262,21 @@ async def check_safe_browsing(urls: list[str]) -> SafeBrowsingResult:
             "threatEntries": [{"url": u} for u in clean_urls[:100]],
         },
     }
-
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.post(f"{SAFE_BROWSING_URL}?key={SAFE_BROWSING_KEY}", json=payload)
             if resp.status_code != 200:
                 return empty
-
             data = resp.json()
             matches = data.get("matches", [])
             if not matches:
                 return empty
-
             threat_urls = list({m.get("threat", {}).get("url", "") for m in matches})
             threat_types = list({m.get("threatType", "") for m in matches})
-            severity = min(len(matches) * 30, 50)
-
             return SafeBrowsingResult(
                 threats_found=len(matches),
                 threat_urls=threat_urls[:3],
-                severity=severity,
+                severity=min(len(matches) * 30, 50),
                 reason=f"Google flagged {len(matches)} URL(s) as {', '.join(threat_types).lower().replace('_', ' ')}",
             )
     except Exception:
@@ -282,7 +287,6 @@ async def check_safe_browsing(urls: list[str]) -> SafeBrowsingResult:
 
 async def check_domain_reputation(domain: str) -> ReputationResult:
     result = ReputationResult(spamhaus_listed=False, surbl_listed=False, severity=0, reason=None)
-
     parts = domain.split('.')
     root_domain = '.'.join(parts[-2:]) if len(parts) >= 2 else domain
 
@@ -298,10 +302,8 @@ async def check_domain_reputation(domain: str) -> ReputationResult:
         dns_lookup(f"{root_domain}.dbl.spamhaus.org"),
         dns_lookup(f"{root_domain}.multi.surbl.org"),
     )
-
     result.spamhaus_listed = spamhaus_listed
     result.surbl_listed = surbl_listed
-
     if spamhaus_listed and surbl_listed:
         result.severity = 45
         result.reason = f"{domain} is listed on both Spamhaus DBL and SURBL - known spam/phishing domain"
@@ -311,8 +313,51 @@ async def check_domain_reputation(domain: str) -> ReputationResult:
     elif surbl_listed:
         result.severity = 30
         result.reason = f"{domain} is listed on SURBL - known malicious domain"
-
     return result
+
+
+# --- Community Blocklist -----------------------------------------------------
+
+async def check_community_blocklist(domain: str) -> CommunityResult:
+    """Check if domain has been reported by other Verity users."""
+    empty = CommunityResult(reported=False, report_count=0, severity=0, reason=None)
+
+    if not DATABASE_URL:
+        return empty
+
+    try:
+        parts = domain.split('.')
+        root_domain = '.'.join(parts[-2:]) if len(parts) >= 2 else domain
+
+        pool = await get_db()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT report_count FROM verity_reports WHERE domain = $1",
+                root_domain
+            )
+
+        if not row:
+            return empty
+
+        count = row['report_count']
+        if count >= 10:
+            severity = 40
+            reason = f"Reported as phishing by {count} Verity users"
+        elif count >= 5:
+            severity = 25
+            reason = f"Reported as phishing by {count} Verity users"
+        elif count >= 2:
+            severity = 15
+            reason = f"Reported as suspicious by {count} Verity users"
+        else:
+            severity = 8
+            reason = f"Reported as suspicious by 1 Verity user"
+
+        return CommunityResult(reported=True, report_count=count, severity=severity, reason=reason)
+
+    except Exception as e:
+        logger.warning(f"[Verity] Community check failed: {e}")
+        return empty
 
 
 # --- Routes ------------------------------------------------------------------
@@ -322,9 +367,52 @@ async def health():
     return {
         "status": "ok",
         "service": "Verity API",
-        "version": "3.0.0",
+        "version": "4.0.0",
         "nlp": "huggingface-api" if HF_TOKEN else "rule-based",
+        "db": "connected" if DATABASE_URL else "not configured",
     }
+
+
+@app.post("/report")
+async def report_domain(req: ReportRequest):
+    """Anonymous phishing report from any Verity user."""
+    if not req.domain or not DATABASE_URL:
+        raise HTTPException(status_code=400, detail="Invalid request")
+
+    domain = req.domain.lower().strip().lstrip("www.")
+    parts = domain.split('.')
+    root_domain = '.'.join(parts[-2:]) if len(parts) >= 2 else domain
+
+    try:
+        pool = await get_db()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO verity_reports (domain, report_count, last_reported)
+                VALUES ($1, 1, NOW())
+                ON CONFLICT (domain)
+                DO UPDATE SET
+                    report_count = verity_reports.report_count + 1,
+                    last_reported = NOW()
+            """, root_domain)
+        return {"status": "reported", "domain": root_domain}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/blocklist")
+async def get_blocklist():
+    """Return domains reported by 2+ users - used by extension on startup."""
+    if not DATABASE_URL:
+        return {"domains": []}
+    try:
+        pool = await get_db()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT domain, report_count FROM verity_reports WHERE report_count >= 2 ORDER BY report_count DESC LIMIT 500"
+            )
+        return {"domains": [{"domain": r["domain"], "count": r["report_count"]} for r in rows]}
+    except Exception as e:
+        return {"domains": []}
 
 
 @app.post("/analyze", response_model=AnalyzeResponse)
@@ -335,11 +423,12 @@ async def analyze(req: AnalyzeRequest):
     domain = req.domain.lower().strip().lstrip("www.")
     full_text = f"{req.subject or ''} {req.body or ''}".strip()
 
-    domain_age, nlp, safe_browsing, reputation = await asyncio.gather(
+    domain_age, nlp, safe_browsing, reputation, community = await asyncio.gather(
         get_domain_age(domain),
         analyze_nlp_model(full_text),
         check_safe_browsing(req.urls or []),
         check_domain_reputation(domain),
+        check_community_blocklist(domain),
     )
 
     return AnalyzeResponse(
@@ -348,4 +437,5 @@ async def analyze(req: AnalyzeRequest):
         nlpSignals=nlp,
         safeBrowsing=safe_browsing,
         reputation=reputation,
+        community=community,
     )
