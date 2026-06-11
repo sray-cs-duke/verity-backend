@@ -54,7 +54,7 @@ def load_model():
         # Primary: phishing-specific BERT model (small, ~250MB)
         classifier = pipeline(
             "text-classification",
-            model="elozano/bert-base-cased-phishing-email",
+            model="ealvaradob/bert-finetuned-phishing",
             truncation=True,
             max_length=512,
         )
